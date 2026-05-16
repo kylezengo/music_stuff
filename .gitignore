@@ -1,2 +1,9 @@
 .DS_Store
 .ipynb_checkpoints
+.env
+data/
+__pycache__/
+*.pyc
+.vscode/
+.claude/
+anaconda_projects/

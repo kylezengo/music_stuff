@@ -1,0 +1,220 @@
+from pathlib import Path
+
+DATA_PATH = Path(__file__).parent / "data"
+REVIEWS_DIR = DATA_PATH / "reviews"
+LINKS_DIR = DATA_PATH / "links"
+FUZZY_CACHE = DATA_PATH / "fuzzy_cache.json"
+
+def _latest_library_xml():
+    lib_dir = DATA_PATH / "library"
+    xmls = sorted(lib_dir.glob("*.xml"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not xmls:
+        raise FileNotFoundError(f"No XML files found in {lib_dir}")
+    return xmls[0]
+
+LIBRARY_XML = _latest_library_xml()
+
+GENRE_CLEANUP = {
+    "Alt. Rock": "Alternative Rock",
+    "Electro-House": "Electro House",
+    "Electonic": "Electronic",
+    "Hip Hop": "Hip-Hop",
+    "Hip - Hop": "Hip-Hop",
+    "[Hip-Hop/Rap]": "Hip-Hop",
+    "Hip Hop/Rap": "Hip-Hop",
+    "Hip-Hop/Rap": "Hip-Hop",
+    "Rap & Hip-Hop": "Hip-Hop",
+    "Post-Rock": "Post Rock",
+    "Other Reggae": "Reggae",
+    "Synth-pop": "Synthpop",
+}
+
+GENRE_NULLS = frozenset({
+    "www.CamelbackMusic.com", "www.mp3-ogg.ru", "data", "Other",
+    "Unknown genre", " ", "131", "144", "60 S", "00s",
+})
+
+# Maps any genre_clean value → one of 10 broad buckets used for clustering.
+# Anything not listed here is excluded from clustering.
+GENRE_BUCKETS = {
+    # Alternative / Indie
+    "Alternative":                                          "Alternative",
+    "Indie":                                                "Alternative",
+    "Indie Rock":                                           "Alternative",
+    "Alternative Rock":                                     "Alternative",
+    "Indie Pop":                                            "Alternative",
+    "Alternative & Punk":                                   "Alternative",
+    "General Alternative":                                  "Alternative",
+    "Indie / Alternative":                                  "Alternative",
+    "shoegaze":                                             "Alternative",
+    "Post Rock":                                            "Alternative",
+    "Lo - Fi":                                              "Alternative",
+    "Dream - Hop":                                          "Alternative",
+    "Fuzz-Folk":                                            "Alternative",
+    "Indietronica":                                         "Alternative",
+    "Indie, Electronic":                                    "Alternative",
+    "General Alternative Rock":                             "Alternative",
+    "AlternRock Alt. Rock":                                 "Alternative",
+    "Indie Rock / Folk Rock / Acoustic":                    "Alternative",
+    "Alternative Rock, Experimental Rock, Electronic Music":"Alternative",
+    "Electronic, shoegaze, post-rock, indie, electonica":   "Alternative",
+    # Rock
+    "Rock":                     "Rock",
+    "Hard Rock":                "Rock",
+    "Classic Rock":             "Rock",
+    "Punk":                     "Rock",
+    "Metal":                    "Rock",
+    "Psychedelic Rock":         "Rock",
+    "Progressive Rock":         "Rock",
+    "Experimental-Rock":        "Rock",
+    "Hard Rock - Comedy":       "Rock",
+    "Prog-Rock/Art Rock":       "Rock",
+    "Grunge":                   "Rock",
+    "Gothic Rock":              "Rock",
+    "Glam Rock":                "Rock",
+    "Acid Punk":                "Rock",
+    "Punk Rock":                "Rock",
+    "Post Punk":                "Rock",
+    "Rock/Pop":                 "Rock",
+    "Pop-Rock":                 "Rock",
+    "Rock/Alternative":         "Rock",
+    "Hard/Heavy":               "Rock",
+    "Doom Metal":               "Rock",
+    "Heavy Metal":              "Rock",
+    "Stoner Doom Metal":        "Rock",
+    "Instrumental Rock":        "Rock",
+    "Rock & Roll":              "Rock",
+    "General Rock":             "Rock",
+    "Slow Rock":                "Rock",
+    "Pop Punk":                 "Rock",
+    "Jam":                      "Rock",
+    "Jam Bands":                "Rock",
+    "Jam Band":                 "Rock",
+    "Primus":                   "Rock",
+    "rock":                     "Rock",
+    "PopRock":                  "Rock",
+    "MTV rock":                 "Rock",
+    # Electronic
+    "Electronic":               "Electronic",
+    "Electronica":              "Electronic",
+    "Dance":                    "Electronic",
+    "Techno":                   "Electronic",
+    "House":                    "Electronic",
+    "Dubstep":                  "Electronic",
+    "Trance":                   "Electronic",
+    "Ambient":                  "Electronic",
+    "Synthpop":                 "Electronic",
+    "Electropop":               "Electronic",
+    "Electro House":            "Electronic",
+    "Progressive House":        "Electronic",
+    "Electro":                  "Electronic",
+    "Electronica & Dance":      "Electronic",
+    "Electronica/Dance":        "Electronic",
+    "Electronic & Dance":       "Electronic",
+    "Dance & House":            "Electronic",
+    "Dance & DJ":               "Electronic",
+    "IDM/Experimental":         "Electronic",
+    "Ambient / Electronic / Experimental": "Electronic",
+    "Trip-Hop":                 "Electronic",
+    "vaporwave":                "Electronic",
+    "Daytime Disco":            "Electronic",
+    "Disco":                    "Electronic",
+    "Euro-House":               "Electronic",
+    "Progressive house":        "Electronic",
+    "Moombahton":               "Electronic",
+    "Electronic Pop":           "Electronic",
+    "Dub Step":                 "Electronic",
+    "Club, Dance":              "Electronic",
+    "Grime/Dubstep":            "Electronic",
+    "Indie Dance / Nu Disco":   "Electronic",
+    "Brainfeeder":              "Electronic",
+    "New Wave":                 "Electronic",
+    "Mashup":                   "Electronic",
+    "breaks":                   "Electronic",
+    "Bass":                     "Electronic",
+    # Hip-Hop
+    "Hip-Hop":                  "Hip-Hop",
+    "Rap":                      "Hip-Hop",
+    "Alternative Hip-Hop":      "Hip-Hop",
+    "Acid Rap":                 "Hip-Hop",
+    "Conscious/Hip-Hop":        "Hip-Hop",
+    "Aussie Hip Hop":           "Hip-Hop",
+    "NewAge Hip-Hop":           "Hip-Hop",
+    "NewAge Hip-Pop":           "Hip-Hop",
+    "G Funk":                   "Hip-Hop",
+    "Rap/Hip-Hop":              "Hip-Hop",
+    "Rave, Hip Hop":            "Hip-Hop",
+    "Hip-Hop/R&B":              "Hip-Hop",
+    "Pop/Rap":                  "Hip-Hop",
+    "Rap/R&B":                  "Hip-Hop",
+    "Acid":                     "Hip-Hop",
+    # Pop
+    "Pop":                      "Pop",
+    "Pop/Rock":                 "Pop",
+    "French Pop":               "Pop",
+    "Top 40":                   "Pop",
+    "Easy Listening":           "Pop",
+    "R&B":                      "Pop",
+    "R&B/Soul":                 "Pop",
+    "Soul":                     "Pop",
+    # Classical
+    "Classical":                "Classical",
+    "Neoclassical":             "Classical",
+    "New Age":                  "Classical",
+    # Jazz
+    "Jazz":                     "Jazz",
+    "Acid Jazz":                "Jazz",
+    "Blues":                    "Jazz",
+    "Fusion":                   "Jazz",
+    "Acapella Jazz":            "Jazz",
+    "Jazz-Rock, Bayou Funk":    "Jazz",
+    # Soundtrack
+    "Soundtrack":               "Soundtrack",
+    # Folk & Country
+    "Folk":                     "Folk & Country",
+    "Country":                  "Folk & Country",
+    "Bluegrass":                "Folk & Country",
+    "Americana":                "Folk & Country",
+    "Folk Rock":                "Folk & Country",
+    "Folk/Rock":                "Folk & Country",
+    "Traditional Folk":         "Folk & Country",
+    "Singer/Songwriter":        "Folk & Country",
+    "Acoustic":                 "Folk & Country",
+    "Americana / Roots / Soul": "Folk & Country",
+    "Indie Folk/Pop":           "Folk & Country",
+    "Indie Folk":               "Folk & Country",
+    # Reggae & World
+    "Reggae":                   "Reggae & World",
+    "Dub":                      "Reggae & World",
+    "Ska":                      "Reggae & World",
+    "Dancehall":                "Reggae & World",
+    "World":                    "Reggae & World",
+    "Ethnic":                   "Reggae & World",
+    "Latin":                    "Reggae & World",
+    "Latino":                   "Reggae & World",
+    "Asia":                     "Reggae & World",
+    "Dance Hall":               "Reggae & World",
+    "Calypso":                  "Reggae & World",
+}
+
+GENRE_ENERGY = frozenset({"Electronic", "Hip-Hop", "Rock"})
+GENRE_CHILL = frozenset({"Classical", "Jazz", "Reggae & World", "Folk & Country", "Soundtrack"})
+
+# Pitchfork genre labels → broad buckets (compound genres like "Pop/R&B" use the first tag)
+PITCHFORK_GENRE_BUCKETS = {
+    "Rock":                         "Rock",
+    "Electronic":                   "Electronic",
+    "Rap":                          "Hip-Hop",
+    "Experimental":                 "Alternative",
+    "Pop/R&B":                      "Pop",
+    "Folk/Country":                 "Folk & Country",
+    "Metal":                        "Rock",
+    "Global":                       "Reggae & World",
+    "Jazz":                         "Jazz",
+    "Metal / Rock":                 "Rock",
+    "Rock / Metal":                 "Rock",
+    "Electronic / Rock":            "Electronic",
+    "Experimental / Rock":          "Alternative",
+    "Experimental / Electronic":    "Electronic",
+    "Pop/R&B / Rap / Electronic":   "Pop",
+}
