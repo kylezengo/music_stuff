@@ -13,11 +13,12 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from sklearn.cluster import KMeans
-from sklearn.metrics import silhouette_samples
+from sklearn.metrics import silhouette_samples, silhouette_score
 from sklearn.preprocessing import StandardScaler
 
 from config import LIBRARY_XML, REVIEWS_DIR, GENRE_BUCKETS, PITCHFORK_GENRE_BUCKETS, GENRE_ENERGY, GENRE_CHILL
 from library import load_library
+from ratings import build_albums
 from reviews import load_reviews
 from mood import extract_mood, MOOD_COLS
 
@@ -38,7 +39,7 @@ def load_playlist_index():
     return {k: {"name": v, "silhouette": None} for k, v in raw.items()}
 
 
-def _build_features(songs):
+def _build_features(songs, complete_cases=False):
     df = songs[
         songs["genre_clean"].notna()
         & (songs["play_count"] > 0)
@@ -50,6 +51,17 @@ def _build_features(songs):
     mask = df["genre_bucket"].isna() & df["pitchfork_genre"].notna()
     df.loc[mask, "genre_bucket"] = df.loc[mask, "pitchfork_genre"].map(PITCHFORK_GENRE_BUCKETS)
     df = df[df["genre_bucket"].notna()].copy()
+
+    # Zero BPM means Essentia got silence (DRM file) — treat as missing
+    if "bpm" in df.columns:
+        df.loc[df["bpm"] == 0, ["bpm", "loudness", "mode"]] = np.nan
+
+    if complete_cases:
+        audio_cols = ["bpm", "loudness", "mode"]
+        mood_cols = [c for c in MOOD_COLS if c in df.columns]
+        has_audio = df[audio_cols].notna().all(axis=1) if all(c in df.columns for c in audio_cols) else pd.Series(False, index=df.index)
+        has_mood = df[mood_cols].notna().all(axis=1) if mood_cols else pd.Series(False, index=df.index)
+        df = df[has_audio & has_mood].copy()
 
     df["skip_ratio"] = df["skip_count"] / (df["play_count"] + 1)
     df["log_plays"] = np.log1p(df["play_count"])
@@ -63,7 +75,6 @@ def _build_features(songs):
         "p4k_score":  df["pitchfork_score"].fillna(df["pitchfork_score"].median()),
     }, index=df.index)
 
-    # Add Essentia audio features if available
     audio_cols = [c for c in ["bpm", "loudness", "mode"] if c in df.columns and df[c].notna().mean() > 0.1]
     if audio_cols:
         audio_num = df[audio_cols].copy()
@@ -74,94 +85,135 @@ def _build_features(songs):
         audio_num = audio_num.fillna(audio_num.median())
         num = pd.concat([num, audio_num], axis=1)
 
-    # Add Pitchfork review mood features (energy, valence, danceability, acousticness)
     available_mood = [c for c in MOOD_COLS if c in df.columns and df[c].notna().mean() > 0.05]
     if available_mood:
         mood_num = df[available_mood].fillna(0.5)
         num = pd.concat([num, mood_num], axis=1)
 
-    features = pd.concat([num, genre_dummies], axis=1).fillna(0)
+    features = pd.concat([num, genre_dummies * 0.2], axis=1).fillna(0)
     return df, features
 
 
-def _mood_label(energy_rank, valence, acoustic, dance):
-    """Return a mood label based on relative ranks and absolute mood averages."""
-    if energy_rank == "high" and dance > valence:
-        return "High Energy"
-    elif energy_rank == "high" and valence < 0.45:
-        return "Intense & Dark"
+def _audio_energy(avg_bpm, avg_loudness):
+    """0-1 energy score from BPM and loudness."""
+    bpm_norm = np.clip((avg_bpm - 40) / 180, 0, 1) if avg_bpm else 0.5
+    loud_norm = np.clip(avg_loudness, 0, 1) if avg_loudness else 0.5
+    return 0.6 * bpm_norm + 0.4 * loud_norm
+
+
+def _mood_label(energy_rank, avg):
+    """Evocative name from the combination of mood dimensions."""
+    bpm = avg.get("bpm") or 100
+    mode = avg.get("mode") or 0.5
+    valence = avg.get("mood_valence", 0.5)
+    acoustic = avg.get("mood_acousticness", 0.5)
+    dance = avg.get("mood_danceability", 0.5)
+
+    is_major = mode > 0.5
+    fast = bpm > 120
+    slow = bpm < 90
+
+    if energy_rank == "high" and fast and dance > 0.52:
+        return "Dance Floor"
+    elif energy_rank == "high" and fast and not is_major:
+        return "Raw & Loud"
+    elif energy_rank == "high" and fast:
+        return "Road Trip"
+    elif energy_rank == "high" and not is_major:
+        return "Dark Energy"
     elif energy_rank == "high":
-        return "Energetic"
-    elif energy_rank == "low" and acoustic > 0.55:
-        return "Acoustic & Intimate"
-    elif energy_rank == "low" and valence < 0.45:
-        return "Dark & Brooding"
+        return "Pump Up"
+    elif energy_rank == "low" and slow and acoustic > 0.5:
+        return "Sunday Morning"
+    elif energy_rank == "low" and not is_major and valence < 0.45:
+        return "Late Night"
+    elif energy_rank == "low" and acoustic > 0.5:
+        return "Unplugged"
+    elif energy_rank == "low" and not is_major:
+        return "Rainy Day"
     elif energy_rank == "low":
-        return "Chill"
-    elif valence > 0.55:
-        return "Warm & Mellow"
+        return "Wind Down"
+    elif dance > 0.55 and is_major:
+        return "Good Vibes"
+    elif not is_major and valence < 0.45:
+        return "Introspective"
+    elif is_major and valence > 0.55:
+        return "Feel Good"
     else:
-        return "Mid Energy"
+        return "Cruising"
 
 
 def _name_clusters(clusters):
-    """Name all clusters relative to each other using mood dimension rankings."""
+    """Name all clusters relative to each other using audio + mood dimension rankings."""
     mood_present = [c for c in MOOD_COLS if any(
         c in cl.columns and cl[c].notna().mean() > 0.1 for cl in clusters
     )]
+    has_audio = all("bpm" in cl.columns and cl["bpm"].notna().mean() > 0.1 for cl in clusters)
 
     avgs = []
     for cluster in clusters:
-        if mood_present:
-            avgs.append({c: cluster[c].mean() for c in mood_present})
-        else:
-            avgs.append({})
+        a = {c: cluster[c].mean() for c in mood_present} if mood_present else {}
+        if has_audio:
+            a["bpm"] = cluster["bpm"].median()
+            a["loudness"] = cluster["loudness"].median()
+            a["mode"] = cluster["mode"].mean()
+        avgs.append(a)
 
-    energy_scores = [a.get("mood_energy", 0.5) for a in avgs]
-    energy_max = max(energy_scores)
-    energy_min = min(energy_scores)
+    # Determine energy rank per cluster — prefer audio signal, fall back to text
+    if has_audio:
+        energy_scores = [_audio_energy(a.get("bpm"), a.get("loudness")) for a in avgs]
+    else:
+        energy_scores = [a.get("mood_energy", 0.5) for a in avgs]
+
+    k = len(clusters)
+    # Rank clusters by energy score; assign high/mid/low by thirds
+    ranked = sorted(range(k), key=lambda i: energy_scores[i])
+    low_cutoff = k // 3
+    high_cutoff = k - k // 3
+    energy_ranks = {}
+    for pos, idx in enumerate(ranked):
+        if pos < low_cutoff:
+            energy_ranks[idx] = "low"
+        elif pos >= high_cutoff:
+            energy_ranks[idx] = "high"
+        else:
+            energy_ranks[idx] = "mid"
 
     names = []
+    seen = {}
     for i, (cluster, avg) in enumerate(zip(clusters, avgs)):
-        top_genre = cluster["genre_bucket"].value_counts().index[0]
+        top_genre = cluster["genre_bucket"].mode()[0]
 
-        if mood_present and energy_max > energy_min:
-            e = energy_scores[i]
-            energy_range = energy_max - energy_min
-            if e >= energy_max - energy_range * 0.25:
-                energy_rank = "high"
-            elif e <= energy_min + energy_range * 0.25:
-                energy_rank = "low"
-            else:
-                energy_rank = "mid"
+        label = _mood_label(energy_ranks[i], avg)
 
-            label = _mood_label(
-                energy_rank,
-                avg.get("mood_valence", 0.5),
-                avg.get("mood_acousticness", 0.5),
-                avg.get("mood_danceability", 0.5),
-            )
-        else:
-            if top_genre in GENRE_ENERGY:
-                label = "High Energy"
-            elif top_genre in GENRE_CHILL:
-                label = "Chill"
-            else:
-                label = "Mid Energy"
-
-        if label == "Mid Energy":
-            names.append(top_genre)
-        else:
-            names.append(f"{label} — {top_genre}")
+        # Deduplicate: append top genre when label would repeat
+        if label in seen:
+            label = f"{label} — {top_genre}"
+        seen[label] = True
+        names.append(label)
 
     return names
 
 
+def _find_optimal_k(X, k_range=range(2, 13)):
+    print(f"Testing k={k_range.start}..{k_range.stop - 1}...")
+    scores = {}
+    for k in k_range:
+        labels = KMeans(n_clusters=k, random_state=42, n_init=10).fit_predict(X)
+        scores[k] = silhouette_score(X, labels)
+        print(f"  k={k:2d}  silhouette={scores[k]:.4f}")
+    best_k = max(scores, key=scores.get)
+    print(f"\nBest k={best_k} (silhouette={scores[best_k]:.4f})")
+    return best_k
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--k", type=int, default=8, help="Number of clusters (default: 8)")
-    parser.add_argument("--size", type=int, default=50, help="Max songs per playlist (default: 50)")
-    parser.add_argument("--audio", action="store_true", help="Enrich with Essentia audio features")
+    parser.add_argument("--k", type=int, default=9, help="Number of clusters (default: 9)")
+    parser.add_argument("--size", type=int, default=30, help="Max songs per playlist (default: 30)")
+    parser.add_argument("--no-audio", action="store_true", help="Skip Essentia audio features")
+    parser.add_argument("--no-complete", action="store_true", help="Include songs missing audio or review data")
+    parser.add_argument("--optimize", action="store_true", help="Find optimal k via silhouette score (k=2-12)")
     args = parser.parse_args()
 
     print("Loading library and reviews...")
@@ -172,17 +224,32 @@ def main():
         how="left", on=["album", "album_artist"]
     )
 
-    if args.audio:
+    albums = build_albums(songs, reviews)
+    songs = songs.merge(
+        albums[["album", "album_artist", "your_rating"]],
+        how="left", on=["album", "album_artist"]
+    )
+    # quality: 60% personal rating, 40% Pitchfork (both 0-10 scale)
+    songs["quality"] = (
+        0.6 * songs["your_rating"].fillna(songs["your_rating"].median()) +
+        0.4 * songs["pitchfork_score"].fillna(songs["pitchfork_score"].median())
+    )
+
+    if not args.no_audio:
         from audio_features import enrich_songs
         print("Enriching with Essentia audio features...")
         songs = enrich_songs(songs)
 
     print("Building features...")
-    df, features = _build_features(songs)
-    print(f"  {len(df):,} songs  |  {features.shape[1]} features  |  k={args.k}")
+    df, features = _build_features(songs, complete_cases=not args.no_complete)
 
     scaler = StandardScaler()
     X = scaler.fit_transform(features)
+
+    if args.optimize:
+        args.k = _find_optimal_k(X)
+
+    print(f"  {len(df):,} songs  |  {features.shape[1]} features  |  k={args.k}")
 
     print("Clustering...")
     km = KMeans(n_clusters=args.k, random_state=42, n_init=10)
@@ -193,46 +260,36 @@ def main():
     sil_by_cluster = pd.Series(sil_scores).groupby(labels).mean()
 
     _PLAYLIST_DIR.mkdir(parents=True, exist_ok=True)
+    for f in _PLAYLIST_DIR.glob("playlist_*.csv"):
+        f.unlink()
+    (_PLAYLIST_DIR / "index.json").unlink(missing_ok=True)
 
-    clusters = [df[df["cluster"] == c].copy() for c in range(args.k)]
-    names = _name_clusters(clusters)
-    cluster_sil = {c: float(sil_by_cluster[c]) for c in range(args.k)}
+    cluster_sizes = df["cluster"].value_counts()
+    clusters = [(c, df[df["cluster"] == c].copy()) for c in range(args.k) if cluster_sizes.get(c, 0) >= 30]
+    names = _name_clusters([cl for _, cl in clusters])
 
-    for c, (cluster, name) in enumerate(zip(clusters, names)):
-        genre_counts = cluster["genre_bucket"].value_counts()
-        genre_pct = (genre_counts / len(cluster) * 100).head(5)
-        avg_decade = cluster[cluster["decade"] > 0]["decade"].mean()
-        skip_ratio = (cluster["skip_count"] / (cluster["play_count"] + 1)).mean()
-
-        print(f"\n{'=' * 60}\n  PLAYLIST {c + 1}: {name.upper()}\n{'=' * 60}")
-        top_genre = genre_counts.index[0]
-        print(f"  Songs: {len(cluster):,}  |  Top genre: {top_genre}  |  Avg decade: {int(avg_decade):,}s")
-        print(f"\n  Genre mix:")
-        for genre, pct in genre_pct.items():
-            bar = "█" * int(pct / 3)
-            print(f"    {genre:<20} {bar} {pct:.0f}%")
-
-        # One song per artist, capped at --size, ordered by play count
+    index = {}
+    saved = 0
+    for (orig_c, cluster), name in zip(clusters, names):
         playlist = (
-            cluster.sort_values("play_count", ascending=False)
+            cluster.sort_values("quality", ascending=False)
             .drop_duplicates(subset="artist")
             .drop_duplicates(subset="album")
             .head(args.size)
         )
+        if len(playlist) < 30:
+            continue
 
-        print(f"\n  Playlist ({len(playlist)} songs — 1 per artist, top {args.size}):")
-        for _, row in playlist[["song_name", "artist", "play_count"]].iterrows():
-            print(f"    {int(row['play_count']):>4}x  {row['song_name'][:40]:<40}  {row['artist']}")
+        saved += 1
+        avg_decade = cluster[cluster["decade"] > 0]["decade"].mean()
+        top_genre = cluster["genre_bucket"].mode()[0]
+        print(f"  [{saved}] {name} — {len(playlist)} songs | {top_genre} | {int(avg_decade)}s")
 
-        out = _PLAYLIST_DIR / f"playlist_{c + 1}.csv"
+        out = _PLAYLIST_DIR / f"playlist_{saved}.csv"
         playlist[["song_name", "artist", "album", "genre_clean", "decade",
-                   "play_count", "skip_count", "pitchfork_score"]].to_csv(out, index=False)
-        print(f"\n  Saved → {out.name}")
+                   "play_count", "skip_count", "pitchfork_score", "your_rating", "quality"]].to_csv(out, index=False)
+        index[out.name] = {"name": name, "silhouette": float(sil_by_cluster[orig_c])}
 
-    index = {
-        f"playlist_{c + 1}.csv": {"name": name, "silhouette": cluster_sil[c]}
-        for c, name in enumerate(names)
-    }
     (_PLAYLIST_DIR / "index.json").write_text(json.dumps(index, indent=2))
     print()
 

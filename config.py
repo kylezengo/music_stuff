@@ -164,7 +164,7 @@ GENRE_BUCKETS = {
     # Jazz
     "Jazz":                     "Jazz",
     "Acid Jazz":                "Jazz",
-    "Blues":                    "Jazz",
+    "Blues":                    "Rock",
     "Fusion":                   "Jazz",
     "Acapella Jazz":            "Jazz",
     "Jazz-Rock, Bayou Funk":    "Jazz",

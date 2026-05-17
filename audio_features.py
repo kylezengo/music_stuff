@@ -12,7 +12,9 @@ Features extracted per track:
 """
 
 import argparse
-import warnings
+import json
+import subprocess
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -25,28 +27,43 @@ _CACHE = Path(__file__).parent / "data" / "audio_features.csv"
 _FEATURE_COLS = ["bpm", "loudness", "mode"]
 
 
-def _analyze(file_path):
-    """Run Essentia analysis on one audio file. Returns dict or None on failure."""
+def _analyze_subprocess(file_path):
+    """Run Essentia in a child process so segfaults don't kill the main script."""
+    code = f"""
+import warnings, json, sys, numpy as np
+warnings.filterwarnings("ignore")
+import essentia.standard as es
+try:
+    audio = es.MonoLoader(filename={json.dumps(file_path)}, sampleRate=22050)()
+    bpm = float(es.PercivalBpmEstimator(sampleRate=22050)(audio))
+    loudness_power = float(es.Loudness()(audio))
+    loudness_db = 10 * np.log10(max(loudness_power, 1e-10))
+    loudness_norm = float(np.clip((loudness_db + 60) / 60, 0, 1))
+    key, scale, _ = es.KeyExtractor()(audio)
+    mode = 1 if scale == "major" else 0
+    print(json.dumps({{"bpm": bpm, "loudness": loudness_norm, "mode": mode}}))
+except Exception as e:
+    print(json.dumps({{"error": str(e)}}))
+"""
     try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            import essentia.standard as es
-
-        audio = es.MonoLoader(filename=file_path, sampleRate=22050)()
-
-        bpm = es.PercivalBpmEstimator(sampleRate=22050)(audio)
-
-        loudness = float(es.Loudness()(audio))
-        # Normalize from roughly -50..0 dB range to 0-1
-        loudness_norm = float(np.clip((loudness + 50) / 50, 0, 1))
-
-        key, scale, _ = es.KeyExtractor()(audio)
-        mode = 1 if scale == "major" else 0
-
-        return {"bpm": float(bpm), "loudness": loudness_norm, "mode": mode}
-
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True, text=True, timeout=30
+        )
+        # Essentia prints many WARNING lines before the result; scan from the end
+        for line in reversed(result.stdout.strip().splitlines()):
+            try:
+                data = json.loads(line)
+                if "error" not in data:
+                    return data
+                return None
+            except json.JSONDecodeError:
+                continue
+    except subprocess.TimeoutExpired:
+        pass
     except Exception:
-        return None
+        pass
+    return None
 
 
 def _load_cache():
@@ -100,7 +117,7 @@ def main():
 
     for i, (_, row) in enumerate(to_analyze.iterrows(), 1):
         path = row["file_path"]
-        result = _analyze(path)
+        result = _analyze_subprocess(path)
 
         if result:
             new_rows.append({"file_path": path, **result})
